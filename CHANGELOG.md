@@ -42,6 +42,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `invoice`: documented and pinned the early-repayment discount rounding rule
+  (#26). The pool's time-proportional discount is
+  `floor(discount * elapsed / term)`, rounded down to the stroop with checked
+  multiplication/division; the buyer receives the unearned remainder as a
+  refund, so its net repayment is `face_value - refund_to_buyer`.
 - `pool.initialize` accepts three new arguments: `share_name`, `share_symbol`
   and `share_decimals`
 

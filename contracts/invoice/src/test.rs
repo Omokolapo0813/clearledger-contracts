@@ -4030,6 +4030,99 @@ fn test_repay_early_reads_stored_funded_amount() {
     assert_eq!(inv.remaining_balance, 0);
 }
 
+// ============== EARLY-REPAYMENT DISCOUNT ROUNDING (issue #26) ==============
+//
+// Protocol decision: the pool's time-proportional discount is
+// `floor(discount * elapsed / term)` (rounded down to the stroop). The buyer
+// keeps the unearned remainder, so its net repayment is
+// `face_value - refund_to_buyer = funded_amount + earned_by_pool`.
+
+#[test]
+fn test_repay_early_zero_discount_refunds_nothing() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let face_value: u128 = DEFAULT_FACE_VALUE;
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &face_value, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+    client.list_for_financing(&invoice_id, &0);
+
+    let pool = mock_pool_with_asset(&env, &usdc);
+    client.set_pool_contract(&pool);
+    let escrow = mock_escrow_for_pool(&env, &pool, &usdc);
+    client.set_escrow_contract(&escrow);
+    client.mark_funded(&invoice_id, &pool, &usdc, &face_value);
+    client.mark_shipped(&invoice_id);
+    client.confirm_delivery(&invoice_id, &issuer);
+    client.confirm_delivery(&invoice_id, &buyer);
+
+    env.ledger().set_timestamp(due_date / 2);
+    mint_tokens(&env, &usdc, &buyer, face_value as i128);
+
+    assert!(client.repay_early(&invoice_id));
+    assert_eq!(MockPoolClient::new(&env, &pool).get_last_refund(), 0);
+    let token = MockTokenClient::new(&env, &usdc);
+    assert_eq!(token.balance(&buyer), 0);
+}
+
+#[test]
+fn test_repay_early_non_divisible_rounds_pool_discount_down() {
+    let (env, client, buyer, invoice_id, pool, _) = setup_confirmed_invoice();
+    // face = 1_000_000_000, 200 bps -> discount = 20_000_000, term = 86_400s.
+    // elapsed = 1s: 20_000_000 / 86_400 = 231.48 -> floor = 231.
+    let face_value: u128 = DEFAULT_FACE_VALUE;
+    let expected_earned: u128 = 231;
+    let expected_refund: u128 = 20_000_000 - expected_earned;
+
+    let usdc = client.get(&invoice_id).funding_asset;
+    env.ledger().set_timestamp(1);
+    mint_tokens(&env, &usdc, &buyer, face_value as i128);
+
+    assert!(client.repay_early(&invoice_id));
+    assert_eq!(
+        MockPoolClient::new(&env, &pool).get_last_refund(),
+        expected_refund
+    );
+
+    let token = MockTokenClient::new(&env, &usdc);
+    assert_eq!(token.balance(&buyer), expected_refund as i128);
+    assert_eq!(face_value - expected_refund, 980_000_000 + expected_earned);
+}
+
+#[test]
+fn test_repay_early_max_valid_discount_rounds_down() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let face_value: u128 = 1_000_000_000;
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+    let invoice_id = client.create(&issuer, &buyer, &face_value, &due_date, &usdc);
+    attest(&env, &client, &invoice_id);
+    // 5000 bps is the maximum accepted listing discount.
+    client.list_for_financing(&invoice_id, &5000);
+
+    let pool = mock_pool_with_asset(&env, &usdc);
+    client.set_pool_contract(&pool);
+    let escrow = mock_escrow_for_pool(&env, &pool, &usdc);
+    client.set_escrow_contract(&escrow);
+    client.mark_funded(&invoice_id, &pool, &usdc, &500_000_000);
+    client.mark_shipped(&invoice_id);
+    client.confirm_delivery(&invoice_id, &issuer);
+    client.confirm_delivery(&invoice_id, &buyer);
+
+    // discount = 500_000_000; at elapsed = 1s over an 86_400s term:
+    // 500_000_000 / 86_400 = 5787.03 -> floor = 5787.
+    let expected_earned: u128 = 5787;
+    let expected_refund: u128 = 500_000_000 - expected_earned;
+    env.ledger().set_timestamp(1);
+    mint_tokens(&env, &usdc, &buyer, face_value as i128);
+
+    assert!(client.repay_early(&invoice_id));
+    assert_eq!(
+        MockPoolClient::new(&env, &pool).get_last_refund(),
+        expected_refund
+    );
+    let token = MockTokenClient::new(&env, &usdc);
+    assert_eq!(token.balance(&buyer), expected_refund as i128);
+}
+
 // ── Issue #872: expire_listing issuer path with explicit auth ────────────────
 //
 // The tests above run under `mock_all_auths()`, which masks the difference

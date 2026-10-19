@@ -1534,6 +1534,16 @@ impl InvoiceContract {
     /// Once cumulative repayment equals `face_value`, the escrow releases the funds
     /// to the pool, the pool's repayment accounting is updated, the invoice transitions
     /// to `Repaid`, and `invoice_repaid` is emitted.
+    ///
+    /// # Early-repayment discount rounding (issue #26)
+    ///
+    /// The pool's time-proportional share of the discount is
+    /// `floor(discount * elapsed / term)`: it is rounded **down** to the whole
+    /// stroop. The buyer receives the remainder as a refund, so the buyer's net
+    /// repayment is `face_value - refund_to_buyer`, i.e.
+    /// `funded_amount + floor(discount * elapsed / term)`. Rounding in the
+    /// buyer's favour means the pool is never credited more discount than the
+    /// elapsed term justifies, and no stroop is manufactured by division.
     pub fn repay_partial(env: Env, invoice_id: BytesN<32>, amount: u128) -> bool {
         require_not_paused(&env);
         let inv_key = DataKey::Invoice(invoice_id.clone());
@@ -1604,17 +1614,16 @@ impl InvoiceContract {
                 .funded_at
                 .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::NotFound));
             let discount = face_value.saturating_sub(funded_amount);
-            let term = invoice.due_date.saturating_sub(funded_at);
-            let elapsed = now.saturating_sub(funded_at);
-            let earned_by_pool = if term == 0 {
-                discount
-            } else {
-                discount
-                    .checked_mul(elapsed as u128)
-                    .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::MathOverflow))
-                    / (term as u128)
-            };
-            let refund_to_buyer = discount.saturating_sub(earned_by_pool);
+            let earned_by_pool = Self::early_repayment_earned_discount(
+                &env,
+                discount,
+                funded_at,
+                invoice.due_date,
+                now,
+            );
+            let refund_to_buyer = discount
+                .checked_sub(earned_by_pool)
+                .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::MathOverflow));
 
             // Step 2: escrow releases full face_value back to pool
             let mut escrow_args = Vec::new(&env);
@@ -1667,6 +1676,36 @@ impl InvoiceContract {
         Self::repay_partial(env, invoice_id, invoice.remaining_balance)
     }
 
+    /// Returns the discount the pool has earned by `now`, rounded down.
+    ///
+    /// Rule (issue #26): `earned = floor(discount * elapsed / term)`, where
+    /// `elapsed = now - funded_at` and `term = due_date - funded_at`, clamped
+    /// via saturating subtraction to non-negative values. Integer division
+    /// truncates toward zero, so the pool never earns a fractional stroop and
+    /// the unearned remainder is refunded to the buyer. When `term == 0` the
+    /// whole discount is earned (no time remains to pro-rate over).
+    ///
+    /// All multiplications are checked; overflow panics with
+    /// [`InvoiceError::MathOverflow`].
+    fn early_repayment_earned_discount(
+        env: &Env,
+        discount: u128,
+        funded_at: u64,
+        due_date: u64,
+        now: u64,
+    ) -> u128 {
+        let term = due_date.saturating_sub(funded_at);
+        if term == 0 {
+            return discount;
+        }
+        let elapsed = now.saturating_sub(funded_at);
+        discount
+            .checked_mul(elapsed as u128)
+            .unwrap_or_else(|| panic_with_error!(env, InvoiceError::MathOverflow))
+            .checked_div(term as u128)
+            .unwrap_or_else(|| panic_with_error!(env, InvoiceError::MathOverflow))
+    }
+
     /// Repays a confirmed invoice before its due date, returning the
     /// pro-rated discount to the buyer.
     ///
@@ -1677,6 +1716,14 @@ impl InvoiceContract {
     /// remaining discount is refunded back to the buyer. This function must
     /// be called before `due_date` — once the invoice is due, use
     /// [`Self::repay`] instead.
+    ///
+    /// # Rounding
+    ///
+    /// The pool's earned discount is `floor(discount * elapsed / term)`,
+    /// rounded **down** to the stroop (integer division truncates). The buyer
+    /// gets the remainder, so its net repayment is
+    /// `face_value - refund_to_buyer = funded_amount + earned_by_pool`.
+    /// See [`Self::early_repayment_earned_discount`].
     ///
     /// # Arguments
     /// * `env` - The Soroban environment.
@@ -1733,18 +1780,16 @@ impl InvoiceContract {
         }
 
         let _prev_status = invoice.status;
-        let term = invoice.due_date.saturating_sub(funded_at);
-        let elapsed = now.saturating_sub(funded_at);
-
-        let earned_by_pool = if term == 0 {
-            discount
-        } else {
-            discount
-                .checked_mul(elapsed as u128)
-                .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::MathOverflow))
-                / (term as u128)
-        };
-        let refund_to_buyer = discount.saturating_sub(earned_by_pool);
+        let earned_by_pool = Self::early_repayment_earned_discount(
+            &env,
+            discount,
+            funded_at,
+            invoice.due_date,
+            now,
+        );
+        let refund_to_buyer = discount
+            .checked_sub(earned_by_pool)
+            .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::MathOverflow));
 
         let buyer = invoice.buyer.clone();
         let funding_asset = invoice.funding_asset.clone();
