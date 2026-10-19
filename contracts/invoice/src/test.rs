@@ -13,7 +13,7 @@ use soroban_sdk::{
 
 use crate::{
     InvoiceContract, InvoiceContractClient, InvoiceError, InvoiceStatus, MAX_BATCH_SIZE,
-    MAX_FACE_VALUE, MAX_PAGE_SIZE, TTL_EXTEND_TO, TTL_THRESHOLD,
+    MAX_FACE_VALUE, MAX_INVOICE_LIFETIME_SECONDS, MAX_PAGE_SIZE, TTL_EXTEND_TO, TTL_THRESHOLD,
 };
 
 // Default invoice parameters used across tests.
@@ -839,6 +839,72 @@ fn test_create_succeeds_when_due_date_one_second_in_future() {
     let events = env.events().all();
     let (event_contract, _topics, _data) = events.last().expect("expected at least one event");
     assert_eq!(event_contract, client.address.clone());
+}
+
+// ============== ISSUE #30: MAX INVOICE LIFETIME BOUNDS ==============
+
+// A due date exactly `MAX_INVOICE_LIFETIME_SECONDS` ahead is accepted: the
+// upper-bound comparator is `due_date > max_due_date`, so equality is valid.
+#[test]
+fn test_create_succeeds_at_max_invoice_lifetime() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    env.ledger().set_timestamp(86400);
+    let now = env.ledger().timestamp();
+    let due_date = now + MAX_INVOICE_LIFETIME_SECONDS;
+
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+
+    let invoice = client.get(&invoice_id);
+    assert_eq!(invoice.status, InvoiceStatus::Created);
+    assert_eq!(invoice.due_date, due_date);
+    assert_eq!(invoice.created_at, now);
+}
+
+// One second past the maximum lifetime is rejected with InvalidDueDate (#7).
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_create_fails_one_second_past_max_invoice_lifetime() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    env.ledger().set_timestamp(86400);
+    let due_date = env.ledger().timestamp() + MAX_INVOICE_LIFETIME_SECONDS + 1;
+
+    client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+}
+
+// A far-future due date (u64::MAX) from a normal ledger time is rejected by
+// the lifetime cap, not silently accepted or truncated.
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_create_fails_far_future_due_date() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    env.ledger().set_timestamp(86400);
+
+    client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &u64::MAX, &usdc);
+}
+
+// When `now + MAX_INVOICE_LIFETIME_SECONDS` would overflow u64, the contract
+// panics with MathOverflow (#15) instead of wrapping.
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn test_create_fails_when_lifetime_addition_overflows() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    env.ledger().set_timestamp(u64::MAX - 1);
+
+    client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &u64::MAX, &usdc);
+}
+
+// Normal success case: a due date comfortably inside the lifetime succeeds.
+#[test]
+fn test_create_succeeds_with_normal_due_date() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    env.ledger().set_timestamp(86400);
+    let due_date = env.ledger().timestamp() + DEFAULT_DUE_OFFSET;
+
+    let invoice_id = client.create(&issuer, &buyer, &DEFAULT_FACE_VALUE, &due_date, &usdc);
+
+    let invoice = client.get(&invoice_id);
+    assert_eq!(invoice.status, InvoiceStatus::Created);
+    assert_eq!(invoice.due_date, due_date);
 }
 
 #[test]
