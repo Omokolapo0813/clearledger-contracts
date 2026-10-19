@@ -1680,7 +1680,9 @@ impl InvoiceContract {
     ///
     /// Rule (issue #26): `earned = floor(discount * elapsed / term)`, where
     /// `elapsed = now - funded_at` and `term = due_date - funded_at`, clamped
-    /// via saturating subtraction to non-negative values. Integer division
+    /// via saturating subtraction to non-negative values. `elapsed` is clamped
+    /// to `term`, so settlement after the due date still earns at most the
+    /// full discount and the buyer refund never underflows. Integer division
     /// truncates toward zero, so the pool never earns a fractional stroop and
     /// the unearned remainder is refunded to the buyer. When `term == 0` the
     /// whole discount is earned (no time remains to pro-rate over).
@@ -1698,7 +1700,7 @@ impl InvoiceContract {
         if term == 0 {
             return discount;
         }
-        let elapsed = now.saturating_sub(funded_at);
+        let elapsed = now.saturating_sub(funded_at).min(term);
         discount
             .checked_mul(elapsed as u128)
             .unwrap_or_else(|| panic_with_error!(env, InvoiceError::MathOverflow))
